@@ -1,0 +1,12 @@
+# 必须要忽略的大文件夹
+checkpoints/
+assets/
+output/
+gradio_tmp/
+__pycache__/
+
+# 忽略具体的大文件类型
+*.pth
+*.ckpt
+*.safetensors
+*.ply__pycache__

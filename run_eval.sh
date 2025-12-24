@@ -1,0 +1,12 @@
+python inference.py \
+--image_dir ./test/eval1 \
+--out_dir ./output \
+--mode 'single_view_eval' \
+--seed 123 \
+--ckpt_path ./checkpoints/model.ckpt \
+--config configs/inference_pvd_1024.yaml \
+--ddim_steps 10 \
+--video_length 16 \
+--device 'cuda:0' \
+--height 320 --width 576 \
+--model_path ./checkpoints/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth
