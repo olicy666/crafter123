@@ -5,6 +5,8 @@ from lvdm.models.utils_diffusion import make_ddim_sampling_parameters, make_ddim
 from lvdm.common import noise_like
 from lvdm.common import extract_into_tensor
 import copy
+from utils.ddim_replay import prepare_replay, preserve_replay
+from utils.observation_guidance import correct_clean_prediction
 
 
 class DDIMSampler(object):
@@ -17,8 +19,8 @@ class DDIMSampler(object):
 
     def register_buffer(self, name, attr):
         if type(attr) == torch.Tensor:
-            if attr.device != torch.device("cuda"):
-                attr = attr.to(torch.device("cuda"))
+            if attr.device != self.model.betas.device:
+                attr = attr.to(self.model.betas.device)
         setattr(self, name, attr)
 
     def make_schedule(self, ddim_num_steps, ddim_discretize="uniform", ddim_eta=0., verbose=True):
@@ -153,12 +155,25 @@ class DDIMSampler(object):
                 img = img.to(dtype=torch.float16)
 
         
-        if timesteps is None:
+        resume_steps, replay_reference, replay_mask, replay_noise = prepare_replay(
+            kwargs, self.ddim_timesteps, ddim_use_original_steps, timesteps, img
+        )
+        if resume_steps is not None:
+            timesteps = self.ddim_timesteps[:resume_steps]
+        elif timesteps is None:
             timesteps = self.ddpm_num_timesteps if ddim_use_original_steps else self.ddim_timesteps
         elif timesteps is not None and not ddim_use_original_steps:
-            subset_end = int(min(timesteps / self.ddim_timesteps.shape[0], 1) * self.ddim_timesteps.shape[0]) - 1
+            subset_end = int(min(timesteps / self.ddim_timesteps.shape[0], 1) * self.ddim_timesteps.shape[0])
+            if subset_end < 1:
+                raise ValueError("timesteps must select at least one DDIM step")
             timesteps = self.ddim_timesteps[:subset_end]
             
+        corrector = kwargs.get('clean_prediction_corrector')
+        if corrector is not None:
+            if ddim_use_original_steps or resume_steps is not None or quantize_denoised:
+                raise ValueError('Observation guidance requires unquantized DDIM without replay')
+            corrector.set_schedule(len(timesteps))
+
         intermediates = {'x_inter': [img], 'pred_x0': [img]}
         time_range = reversed(range(0,timesteps)) if ddim_use_original_steps else np.flip(timesteps)
         total_steps = timesteps if ddim_use_original_steps else timesteps.shape[0]
@@ -186,6 +201,8 @@ class DDIMSampler(object):
 
 
 
+            img = preserve_replay(self.model, img, replay_reference, replay_mask, replay_noise, step)
+
             outs = self.p_sample_ddim(img, cond, ts, index=index, use_original_steps=ddim_use_original_steps,
                                       quantize_denoised=quantize_denoised, temperature=temperature,
                                       noise_dropout=noise_dropout, score_corrector=score_corrector,
@@ -198,6 +215,8 @@ class DDIMSampler(object):
 
 
             img, pred_x0 = outs
+            if index == 0 and replay_reference is not None:
+                img = torch.where(replay_mask.bool(), replay_reference, img)
             if callback: callback(i)
             if img_callback: img_callback(pred_x0, i)
 
@@ -212,6 +231,7 @@ class DDIMSampler(object):
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
                       unconditional_guidance_scale=1., unconditional_conditioning=None,
                       uc_type=None, cfg_img=None,mask=None,x0=None,guidance_rescale=0.0, **kwargs):
+        corrector = kwargs.pop('clean_prediction_corrector', None)
         b, *_, device = *x.shape, x.device
         if x.dim() == 5:
             is_video = True
@@ -265,6 +285,8 @@ class DDIMSampler(object):
         else:
             pred_x0 = self.model.predict_start_from_z_and_v(x, t, model_output)
         
+        pred_x0 = correct_clean_prediction(self, pred_x0, corrector, index, t)
+
         if self.model.use_dynamic_rescale:
             scale_t = torch.full(size, self.ddim_scale_arr[index], device=device)
             prev_scale_t = torch.full(size, self.ddim_scale_arr_prev[index], device=device)

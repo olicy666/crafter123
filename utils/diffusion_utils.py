@@ -116,14 +116,82 @@ def get_latent_z(model, videos):
 
 from .frame_data import FrameData
 
+@torch.no_grad()
 def image_guided_synthesis(model, prompts, videos, noise_shape, n_samples=1, ddim_steps=50, ddim_eta=1., \
-                        unconditional_guidance_scale=1.0, cfg_img=None, fs=None, text_input=False, multiple_cond_cfg=False, timestep_spacing='uniform', guidance_rescale=0.0, condition_index=None, warp_guidance=None, frame_list=None, **kwargs):
+                        unconditional_guidance_scale=1.0, cfg_img=None, fs=None, text_input=False, multiple_cond_cfg=False, timestep_spacing='uniform', guidance_rescale=0.0, condition_index=None, warp_guidance=None, frame_list=None, return_evidence=False, seed=42, loop_config=None, observation_frames=None, observation_guidance_config=None, **kwargs):
+    from utils.observation_loop import LoopConfig, ObservationLoop
+    loop_config = LoopConfig() if loop_config is None else loop_config
+    from utils.observation_guidance import ObservationGuidanceConfig, ObservationGuidance
+    obs_config = observation_guidance_config or ObservationGuidanceConfig()
+    if obs_config.enabled and loop_config.enabled:
+        raise ValueError('Choose sampling observation guidance or the legacy observation loop')
+    if loop_config.enabled and (warp_guidance is None or not frame_list):
+        raise ValueError('observation_loop requires a geometry router and frame_list')
+    if loop_config.enabled and ddim_steps < 1:
+        raise ValueError('observation_loop requires positive ddim_steps')
+    if len(noise_shape) != 5:
+        raise ValueError(f"noise_shape must be [B, C, T, H, W], got {noise_shape}")
+    if obs_config.enabled and (warp_guidance is None or frame_list is None
+                               or len(frame_list) != noise_shape[2] or ddim_steps < 1):
+        raise ValueError('Observation guidance requires geometry, one FrameData per view, and positive ddim_steps')
+    if not torch.is_tensor(videos) or videos.ndim != 5:
+        raise ValueError(
+            "videos must be a tensor with shape [B, 3, T, H, W], "
+            f"got {type(videos).__name__} with shape "
+            f"{getattr(videos, 'shape', None)}"
+        )
+    if videos.shape[0] != noise_shape[0]:
+        raise ValueError(
+            "videos and noise_shape must have the same batch size, "
+            f"got {videos.shape[0]} and {noise_shape[0]}"
+        )
+    if videos.shape[2] != noise_shape[2]:
+        raise ValueError(
+            "videos and noise_shape must have the same temporal length, "
+            f"got {videos.shape[2]} and {noise_shape[2]}"
+        )
+    if videos.shape[1] != 3:
+        raise ValueError(
+            "videos must contain RGB channels in dimension 1, "
+            f"got {videos.shape[1]}"
+        )
+    if n_samples <= 0:
+        raise ValueError(f"n_samples must be positive, got {n_samples}")
+    if condition_index is None or len(condition_index) == 0:
+        raise ValueError("condition_index must contain at least one frame index")
+    condition_index = [int(index) for index in condition_index]
+    if any(index < 0 or index >= noise_shape[2] for index in condition_index):
+        raise ValueError(
+            "condition_index must refer to frames inside noise_shape[2], "
+            f"got {condition_index} for {noise_shape[2]} frames"
+        )
+
     ddim_sampler = DDIMSampler(model) if not multiple_cond_cfg else DDIMSampler_multicond(model)
     batch_size = noise_shape[0]
-    fs = torch.tensor([fs] * batch_size, dtype=torch.long, device=model.device)
+    if fs is None:
+        fs = torch.zeros(batch_size, dtype=torch.long, device=model.device)
+    elif torch.is_tensor(fs):
+        fs = fs.to(device=model.device, dtype=torch.long).reshape(-1)
+        if fs.numel() == 1:
+            fs = fs.expand(batch_size)
+        elif fs.numel() != batch_size:
+            raise ValueError(f"fs must contain one value or one value per batch item, got {fs.numel()}")
+    else:
+        fs = torch.full((batch_size,), int(fs), dtype=torch.long, device=model.device)
 
-    if not text_input:
+    if not text_input or prompts is None:
         prompts = [""]*batch_size
+    elif isinstance(prompts, str):
+        prompts = [prompts]
+    else:
+        prompts = list(prompts)
+        if len(prompts) == 1 and batch_size > 1:
+            prompts = prompts * batch_size
+    if len(prompts) != batch_size:
+        raise ValueError(
+            f"prompts must contain one string or one string per batch item, "
+            f"got {len(prompts)} for batch size {batch_size}"
+        )
     assert condition_index is not None, "Error: condition index is None!"
 
     img = videos[:,:,condition_index[0]] #bchw
@@ -148,6 +216,11 @@ def image_guided_synthesis(model, prompts, videos, noise_shape, n_samples=1, ddi
             uc_emb = model.get_learned_conditioning(prompts)
         elif model.uncond_type == "zero_embed":
             uc_emb = torch.zeros_like(cond_emb)
+        else:
+            raise ValueError(
+                "multiple-condition CFG requires model.uncond_type to be "
+                "'empty_seq' or 'zero_embed'"
+            )
         uc_img_emb = model.embedder(torch.zeros_like(img)) ## b l c
         uc_img_emb = model.image_proj_model(uc_img_emb)
         uc = {"c_crossattn": [torch.cat([uc_emb,uc_img_emb],dim=1)]}
@@ -156,8 +229,14 @@ def image_guided_synthesis(model, prompts, videos, noise_shape, n_samples=1, ddi
     else:
         uc = None
 
-    ## we need one more unconditioning image=yes, text=""
-    if multiple_cond_cfg and cfg_img != 1.0:
+    # The multi-condition sampler always evaluates a third branch whenever
+    # classifier-free guidance is active.  Construct it independently of the
+    # image guidance scale; otherwise ``cfg_img=None`` or ``cfg_img=1`` would
+    # leave the sampler with a missing conditioning object.
+    effective_cfg_img = (
+        unconditional_guidance_scale if cfg_img is None else cfg_img
+    )
+    if multiple_cond_cfg and unconditional_guidance_scale != 1.0:
         uc_2 = {"c_crossattn": [torch.cat([uc_emb,img_emb],dim=1)]}
         if model.model.conditioning_key == 'hybrid':
             uc_2["c_concat"] = [img_cat_cond]
@@ -169,6 +248,7 @@ def image_guided_synthesis(model, prompts, videos, noise_shape, n_samples=1, ddi
     cond_mask = None
 
     batch_variants = []
+    evidence_record = {}
     for sample_idx in range(n_samples):
 
         if z0 is not None:
@@ -179,72 +259,110 @@ def image_guided_synthesis(model, prompts, videos, noise_shape, n_samples=1, ddi
         if ddim_sampler is not None:
             condition_set = set(condition_index or [])
             
-            # ========== WAVE-style: Use shared seed for consistent noise ==========
-            # Generate initial noise with a shared seed for frame consistency
-            noise_seed = 42 + sample_idx  # Different seed per sample, but consistent across frames
+            # Use a shared seed so the evidence-controlled latent trajectory
+            # remains comparable across the generated frames.
+            base_seed = 42 if seed is None else int(seed)
+            noise_seed = base_seed + sample_idx  # Different seed per sample, but consistent across frames
+            # DDIM's stochastic updates draw from the global torch RNG rather
+            # than the local generator used for x_T.  Reset it here so paired
+            # Base/router runs with the same seed differ only in the intended
+            # evidence-routing intervention.
+            torch.manual_seed(noise_seed)
             generator = torch.Generator(device=model.device).manual_seed(noise_seed)
-            x_T = torch.randn(noise_shape[0], noise_shape[1], noise_shape[2], noise_shape[3], noise_shape[4], 
-                             generator=generator, device=model.device)
+            x_T = torch.randn(
+                tuple(noise_shape), generator=generator, device=model.device
+            )
             geo_bias = None
+            selection_history = {}
 
-            if warp_guidance is not None and frame_list is not None and len(frame_list) > 0:
+            controller = None
+            if obs_config.enabled:
+                warp_guidance.set_diffusion_model(model)
+                controller = ObservationGuidance(warp_guidance, frame_list, condition_set,
+                                                 obs_config, observation_frames)
+
+            if not obs_config.enabled and warp_guidance is not None and frame_list is not None and len(frame_list) > 0:
                 # Set diffusion model reference for q_sample operations
                 warp_guidance.set_diffusion_model(model)
                 warp_guidance.shared_noise_seed = noise_seed
-                
+
                 n_frames = min(noise_shape[2], len(frame_list))
-                selection_history = {}
 
                 for t in range(n_frames):
                     ref_indices, per_ref_warp = warp_guidance.select_reference_frames(t, frame_list)
+                    evidence_state = warp_guidance.build_evidence_state(
+                        t, frame_list, ref_indices, per_ref_warp
+                    )
                     selection_history[t] = {
                         'ref_indices': ref_indices,
-                        'per_ref_warp': per_ref_warp
+                        'per_ref_warp': per_ref_warp,
+                        'evidence_state': evidence_state,
                     }
-
                     if t in condition_set or not ref_indices:
+                        evidence_state['initialization'] = {
+                            'mode': getattr(warp_guidance, 'init_scale_mode', 'legacy'),
+                            'applied': False,
+                            'reason': 'conditioned_frame' if t in condition_set else 'no_references',
+                        }
+                        evidence_record.setdefault(sample_idx, {})[t] = \
+                            warp_guidance.export_evidence_state(evidence_state)
                         continue
 
-                    updated_noise = warp_guidance.initialize_noise_with_pani(
+                    updated_noise = warp_guidance.initialize_noise_with_fmi(
                         t,
                         x_T[:, :, t],
                         frame_list,
                         ref_indices,
-                        per_ref_warp
+                        per_ref_warp,
+                        evidence_state=evidence_state,
                     )
                     x_T[:, :, t] = updated_noise
+                    evidence_record.setdefault(sample_idx, {})[t] = \
+                        warp_guidance.export_evidence_state(evidence_state)
 
-                geo_bias = warp_guidance.build_frame_attention_bias(
+                geo_bias = warp_guidance.build_cga_bias(
                     selection_history=selection_history,
-                    total_frames=n_frames,
+                    total_frames=noise_shape[2],
                     batch_size=noise_shape[0]
                 )
+                if geo_bias is not None:
+                    geo_bias['num_diffusion_steps'] = int(getattr(model, 'num_timesteps', 1000))
 
             sampler_kwargs = dict(kwargs)
+            if controller is not None:
+                if sampler_kwargs.get('geo_bias') is not None:
+                    raise ValueError('Sampling observation guidance cannot be combined with CGA')
+                sampler_kwargs['clean_prediction_corrector'] = controller
             if geo_bias is not None:
                 sampler_kwargs.update({"geo_bias": geo_bias})
 
-            samples, _ = ddim_sampler.sample(S=ddim_steps,
-                                            conditioning=cond,
-                                            batch_size=batch_size,
-                                            shape=noise_shape[1:],
-                                            verbose=False,
-                                            unconditional_guidance_scale=unconditional_guidance_scale,
-                                            unconditional_conditioning=uc,
-                                            eta=ddim_eta,
-                                            cfg_img=cfg_img,
-                                            mask=cond_mask,
-                                            x0=cond_z0,
-                                            x_T=x_T,
-                                            fs=fs,
-                                            timestep_spacing=timestep_spacing,
-                                            guidance_rescale=guidance_rescale,
-                                            **sampler_kwargs
-                                            )
+            sample_arguments = dict(sampler_kwargs)
+            sample_arguments.update(
+                S=ddim_steps, conditioning=cond, batch_size=batch_size, shape=noise_shape[1:],
+                verbose=False, unconditional_guidance_scale=unconditional_guidance_scale,
+                unconditional_conditioning=uc, eta=ddim_eta, cfg_img=effective_cfg_img,
+                mask=cond_mask, x0=cond_z0, x_T=x_T, fs=fs,
+                timestep_spacing=timestep_spacing, guidance_rescale=guidance_rescale,
+            )
+            samples, _ = ddim_sampler.sample(**sample_arguments)
+            if controller is not None:
+                for frame_index, record in controller.records.items():
+                    evidence_record.setdefault(sample_idx, {}).setdefault(frame_index, {})['observation_guidance'] = record
 
         ## reconstruct from latent to pixel space
         batch_images = model.decode_first_stage(samples)
+        if loop_config.enabled:
+            controller = ObservationLoop(warp_guidance, frame_list[:noise_shape[2]],
+                                         condition_set, loop_config, observation_frames)
+            samples, batch_images, loop_records = controller.run(
+                model, ddim_sampler, samples, batch_images, sample_arguments, noise_seed,
+            )
+            for frame_index, record in loop_records.items():
+                evidence_record.setdefault(sample_idx, {}).setdefault(frame_index, {})['observation_loop'] = record
         batch_variants.append(batch_images)
     ## variants, batch, c, t, h, w
     batch_variants = torch.stack(batch_variants)
-    return batch_variants.permute(1, 0, 2, 3, 4, 5)
+    result = batch_variants.permute(1, 0, 2, 3, 4, 5)
+    if return_evidence:
+        return result, evidence_record
+    return result

@@ -9,4 +9,9 @@ __pycache__/
 *.pth
 *.ckpt
 *.safetensors
-*.ply__pycache__
+*.ply
+
+# Local caches and editor files
+.DS_Store
+*.swp
+.pytest_cache/

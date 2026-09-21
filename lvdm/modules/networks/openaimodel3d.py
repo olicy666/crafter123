@@ -33,7 +33,7 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
     support it as an extra input.
     """
 
-    def forward(self, x, emb, context=None, batch_size=None):
+    def forward(self, x, emb, context=None, batch_size=None, geo_bias=None):
         for layer in self:
             if isinstance(layer, TimestepBlock):
                 x = layer(x, emb, batch_size=batch_size)
@@ -41,7 +41,7 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
                 x = layer(x, context)
             elif isinstance(layer, TemporalTransformer):
                 x = rearrange(x, '(b f) c h w -> b c f h w', b=batch_size)
-                x = layer(x, context)
+                x = layer(x, context, geo_bias=geo_bias)
                 x = rearrange(x, 'b c f h w -> (b f) c h w')
             else:
                 x = layer(x)
@@ -549,6 +549,24 @@ class UNetModel(nn.Module):
         b,_,t,_,_ = x.shape
         t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False).type(x.dtype)
         emb = self.time_embed(t_emb)
+
+        geo_bias = kwargs.get('geo_bias', None)
+        if isinstance(geo_bias, dict):
+            # Geometry has a stronger role when the latent is mostly noise,
+            # and is relaxed as appearance is resolved in later steps.
+            geo_bias = dict(geo_bias)
+            num_steps = max(float(geo_bias.get('num_diffusion_steps', 1000)), 1.0)
+            progress = timesteps.float().reshape(-1).clamp(0.0, num_steps) / num_steps
+            if progress.numel() == 1:
+                progress = progress.expand(b)
+            elif progress.numel() != b:
+                # The denoiser normally receives one timestep per sample.  A
+                # scalar fallback keeps custom callers safe without silently
+                # mixing different samples' noise levels.
+                progress = progress.mean().expand(b)
+            early_scale = float(geo_bias.get('geo_early_scale', 1.0))
+            late_scale = float(geo_bias.get('geo_late_scale', 0.35))
+            geo_bias['temporal_scale'] = early_scale * progress + late_scale * (1.0 - progress)
         
         ## repeat t times for context [(b t) 77 768] & time embedding
         ## check if we use per-frame image conditioning
@@ -580,9 +598,9 @@ class UNetModel(nn.Module):
         adapter_idx = 0
         hs = []
         for id, module in enumerate(self.input_blocks):
-            h = module(h, emb, context=context, batch_size=b)
+            h = module(h, emb, context=context, batch_size=b, geo_bias=geo_bias)
             if id ==0 and self.addition_attention:
-                h = self.init_attn(h, emb, context=context, batch_size=b)
+                h = self.init_attn(h, emb, context=context, batch_size=b, geo_bias=geo_bias)
             ## plug-in adapter features
             if ((id+1)%3 == 0) and features_adapter is not None:
                 h = h + features_adapter[adapter_idx]
@@ -591,10 +609,10 @@ class UNetModel(nn.Module):
         if features_adapter is not None:
             assert len(features_adapter)==adapter_idx, 'Wrong features_adapter'
 
-        h = self.middle_block(h, emb, context=context, batch_size=b)
+        h = self.middle_block(h, emb, context=context, batch_size=b, geo_bias=geo_bias)
         for module in self.output_blocks:
             h = torch.cat([h, hs.pop()], dim=1)
-            h = module(h, emb, context=context, batch_size=b)
+            h = module(h, emb, context=context, batch_size=b, geo_bias=geo_bias)
         h = h.type(x.dtype)
         y = self.out(h)
         

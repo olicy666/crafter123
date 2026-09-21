@@ -1,4 +1,5 @@
 import sys
+from contextlib import nullcontext
 sys.path.append('./extern/dust3r')
 from dust3r.inference import inference, load_model
 from dust3r.utils.image import load_images
@@ -22,8 +23,11 @@ import torchvision.transforms as transforms
 from PIL import Image
 from utils.pvd_utils import *
 from utils.auto_traj_planner import plan_traj_sequences, write_traj_txt
-from utils.warp_guidance import WarpGuidanceEngine
+from utils.warp_guidance import EvidenceRoutingEngine, nearest_valid_depth
 from utils.frame_data import FrameData
+from utils.observation_loop import LoopConfig
+from utils.observation_guidance import ObservationGuidanceConfig
+from utils.evidence_records import save_evidence_window
 from omegaconf import OmegaConf
 from pytorch_lightning import seed_everything
 from utils.diffusion_utils import instantiate_from_config,load_model_checkpoint,image_guided_synthesis
@@ -33,7 +37,16 @@ from torchvision.utils import save_image
 class ViewCrafter:
     def __init__(self, opts, gradio = False):
         self.opts = opts
+        self.loop_config = LoopConfig.from_options(opts)
+        self.observation_guidance_config = ObservationGuidanceConfig.from_options(opts)
+        if self.loop_config.enabled and self.observation_guidance_config.enabled:
+            raise ValueError('Choose --observation_guidance or --observation_loop, not both')
+        if self.loop_config.enabled:
+            self.opts.init_scale_mode = 'uncertainty'
         self.device = opts.device
+        self.last_evidence_record = {}
+        self.evidence_record_paths = []
+        self.evidence_window_index = 0
         self.setup_dust3r()
         self.setup_diffusion()
         self.setup_warp_guidance()
@@ -89,8 +102,10 @@ class ViewCrafter:
             # The depth is stored in raster_results.zbuf
             zbuf = raster_results.zbuf  # Shape: (B, H, W, points_per_pixel)
 
-            # Select the minimum depth for each pixel (closest point)
-            depths, _ = torch.min(zbuf, dim=-1)  # Shape: (B, H, W)
+            # Select the nearest positive point.  Empty points-per-pixel
+            # slots use negative sentinels in PyTorch3D and must not win a
+            # raw ``min`` reduction.
+            depths = nearest_valid_depth(zbuf)  # Shape: (B, H, W)
 
             # Convert to (B, 1, H, W) format and mask invalid values
             depths = depths.unsqueeze(1)  # (B, 1, H, W)
@@ -99,7 +114,12 @@ class ViewCrafter:
             print(f"Error generating depth map: {e}")
             print("Falling back to placeholder depth")
             # Fall back to placeholder if any error occurs
-            B, _, H, W = images.shape
+            if images.ndim != 4:
+                raise ValueError(
+                    "The point renderer must return [B, H, W, C] images, "
+                    f"got {tuple(images.shape)}"
+                )
+            B, H, W, _ = images.shape
             depths = torch.zeros(B, 1, H, W, device=device)
 
         if nbv:
@@ -118,22 +138,51 @@ class ViewCrafter:
         return render_results, viewmask, depths
 
     
-    def run_diffusion(self, renderings, frame_list=None):
+    def run_diffusion(self, renderings, frame_list=None, observation_frames=None):
 
+        if getattr(self.opts, 'export_reconstruction', False):
+            if not frame_list or self.warp_guidance is None:
+                raise ValueError('Reconstruction export requires geometric frame records')
+            if self.noise_shape[0] != 1:
+                raise ValueError('Reconstruction export supports one scene per batch')
         prompts = [self.opts.prompt]
         videos = (renderings * 2. - 1.).permute(3,0,1,2).unsqueeze(0).to(self.device)
         condition_index = [0]
-        with torch.no_grad(), torch.cuda.amp.autocast():
+        autocast_context = (
+            torch.cuda.amp.autocast()
+            if torch.device(self.device).type == 'cuda'
+            else nullcontext()
+        )
+        with torch.no_grad(), autocast_context:
             # [1,1,c,t,h,w]
-            batch_samples = image_guided_synthesis(self.diffusion, prompts, videos, self.noise_shape, self.opts.n_samples, self.opts.ddim_steps, self.opts.ddim_eta, \
-                               self.opts.unconditional_guidance_scale, self.opts.cfg_img, self.opts.frame_stride, self.opts.text_input, self.opts.multiple_cond_cfg, self.opts.timestep_spacing, self.opts.guidance_rescale, condition_index, warp_guidance=self.warp_guidance, frame_list=frame_list)
+            batch_samples, evidence_record = image_guided_synthesis(self.diffusion, prompts, videos, self.noise_shape, self.opts.n_samples, self.opts.ddim_steps, self.opts.ddim_eta, \
+                               self.opts.unconditional_guidance_scale, self.opts.cfg_img, self.opts.frame_stride, self.opts.text_input, self.opts.multiple_cond_cfg, self.opts.timestep_spacing, self.opts.guidance_rescale, condition_index, warp_guidance=self.warp_guidance, frame_list=frame_list, return_evidence=True, seed=getattr(self.opts, 'seed', 42), loop_config=self.loop_config, observation_frames=observation_frames, observation_guidance_config=self.observation_guidance_config)
+
+            # Keep the RGB return type unchanged while exposing an auditable
+            # record for a downstream reconstruction stage.
+            self.last_evidence_record = evidence_record
+            if getattr(self.opts, 'save_evidence', True) and evidence_record:
+                record_path = save_evidence_window(
+                    evidence_record, self.opts.save_dir,
+                    self.evidence_window_index, self.opts, frame_list,
+                )
+                self.evidence_record_paths.append(record_path)
+            if getattr(self.opts, 'export_reconstruction', False):
+                from utils.reconstruction_data import save_reconstruction_window
+                self.last_reconstruction_path = save_reconstruction_window(
+                    ((batch_samples[0, 0].permute(1, 0, 2, 3).float() + 1) / 2).clamp(0, 1),
+                    frame_list, observation_frames, self.warp_guidance,
+                    self.opts, self.evidence_window_index,
+                )
+            self.evidence_window_index += 1
 
             # save_results_seperate(batch_samples[0], self.opts.save_dir, fps=8)
             # torch.Size([1, 3, 25, 576, 1024]) [-1,1]
 
         return torch.clamp(batch_samples[0][0].permute(1,2,3,0), -1., 1.) 
 
-    def _prepare_frame_list(self, render_results, depths, camera_traj, viewmask=None, reference_overrides=None):
+    def _prepare_frame_list(self, render_results, depths, camera_traj, viewmask=None, reference_overrides=None,
+                            observation_indices=None):
         if getattr(self, 'warp_guidance', None) is None:
             return None
         if render_results is None or depths is None or camera_traj is None:
@@ -152,21 +201,46 @@ class ViewCrafter:
         depth_tensor = depth_tensor.to(self.device).float()
 
         B, H, W, _ = render_tensor.shape
-        if depth_tensor.shape[0] != B or depth_tensor.shape[-2:] != (H, W):
-            depth_tensor = F.interpolate(depth_tensor, size=(H, W), mode='bilinear', align_corners=False)
+        if depth_tensor.dim() == 3:
+            depth_tensor = depth_tensor.unsqueeze(1)
+        elif depth_tensor.dim() == 4 and depth_tensor.shape[-1] == 1 and depth_tensor.shape[1] != 1:
+            depth_tensor = depth_tensor.permute(0, 3, 1, 2)
+        if depth_tensor.dim() != 4:
+            raise ValueError(
+                f"Depth maps must have shape [B, 1, H, W], got {tuple(depth_tensor.shape)}"
+            )
+        if depth_tensor.shape[0] != B:
+            raise ValueError(
+                "renderings and depth maps must have the same batch size, "
+                f"got {B} and {depth_tensor.shape[0]}"
+            )
+        if depth_tensor.shape[-2:] != (H, W):
+            # Nearest-neighbor resizing preserves zero-valued renderer holes;
+            # bilinear interpolation would turn invalid gaps into fake depth.
+            depth_tensor = F.interpolate(depth_tensor, size=(H, W), mode='nearest')
 
         mask_tensor = None
         if viewmask is not None:
             mask_tensor = viewmask
             if not torch.is_tensor(mask_tensor):
                 mask_tensor = torch.from_numpy(np.asarray(mask_tensor))
-            if mask_tensor.dim() == 4 and mask_tensor.shape[-1] == 3:
+            if (mask_tensor.dim() == 4 and mask_tensor.shape[-1] in (1, 3)
+                    and mask_tensor.shape[1] not in (1, 3)):
                 mask_tensor = mask_tensor.permute(0, 3, 1, 2)
             mask_tensor = mask_tensor.to(self.device).float()
             if mask_tensor.dim() == 3:
                 mask_tensor = mask_tensor.unsqueeze(1)
+            if mask_tensor.dim() != 4 or mask_tensor.shape[0] != B:
+                raise ValueError(
+                    "viewmask must have the same batch size as renderings and "
+                    f"be a 3-D/4-D map, got {tuple(mask_tensor.shape)}"
+                )
             if mask_tensor.shape[1] != 1:
                 mask_tensor = mask_tensor.mean(dim=1, keepdim=True)
+            if mask_tensor.shape[-2:] != (H, W):
+                mask_tensor = F.interpolate(
+                    mask_tensor, size=(H, W), mode='nearest'
+                )
             mask_tensor = (mask_tensor > 0.1).float()
 
         coarse_tensor = render_tensor.permute(0, 3, 1, 2)
@@ -176,7 +250,8 @@ class ViewCrafter:
                 overrides[idx] = self._format_reference_image(image, (H, W))
 
         if hasattr(camera_traj, 'R'):
-            num_cams = camera_traj.R.shape[0]
+            rotation = camera_traj.R
+            num_cams = 1 if rotation.dim() == 2 else rotation.shape[0]
         else:
             num_cams = B
         num_frames = min(B, num_cams)
@@ -190,8 +265,11 @@ class ViewCrafter:
                 mask = mask_tensor[idx:idx+1]
             else:
                 mask = (depth > 0).float()
-            camera = self._extract_camera_dict(camera_traj, idx)
-            frame_list.append(FrameData(rgb, coarse_rgb, depth, mask, camera))
+            camera = self._extract_camera_dict(
+                camera_traj, idx, image_size=(H, W)
+            )
+            observed = idx in overrides if observation_indices is None else idx in observation_indices
+            frame_list.append(FrameData(rgb, coarse_rgb, depth, mask, camera, is_observation=observed))
 
         return frame_list
 
@@ -203,10 +281,28 @@ class ViewCrafter:
             arr = np.asarray(image)
             tensor = torch.from_numpy(arr).to(self.device)
         tensor = tensor.float()
-        if tensor.dim() == 3 and tensor.shape[0] != 3:
-            tensor = tensor.permute(2, 0, 1)
         if tensor.dim() == 4:
+            if tensor.shape[0] != 1:
+                raise ValueError(
+                    "A reference image must contain one image, got "
+                    f"shape {tuple(tensor.shape)}"
+                )
             tensor = tensor.squeeze(0)
+        if tensor.dim() == 2:
+            tensor = tensor.unsqueeze(0)
+        elif tensor.dim() == 3:
+            if tensor.shape[0] not in (1, 3) and tensor.shape[-1] in (1, 3):
+                tensor = tensor.permute(2, 0, 1)
+            elif tensor.shape[0] not in (1, 3):
+                raise ValueError(
+                    "A reference image must be channel-first or channel-last "
+                    f"with one or three channels, got shape {tuple(tensor.shape)}"
+                )
+        else:
+            raise ValueError(
+                "A reference image must have 2, 3, or 4 dimensions, got "
+                f"shape {tuple(tensor.shape)}"
+            )
         tensor = tensor.unsqueeze(0)
         tensor = F.interpolate(tensor, size=(H, W), mode='bilinear', align_corners=False)
         tensor = tensor.clamp(0.0, 1.0)
@@ -216,25 +312,101 @@ class ViewCrafter:
         tensor = self._format_reference_image(image, (self.opts.height, self.opts.width))
         return tensor.squeeze(0).permute(1, 2, 0)
 
-    def _extract_camera_dict(self, camera_traj, idx):
+    def _camera_parameter(self, value, idx, width, name):
+        """Select one camera parameter and normalize it to ``[1, width]``."""
+        if value is None:
+            return None
+        value = value.to(self.device)
+        if value.dim() == 0:
+            value = value.reshape(1, 1)
+        elif value.dim() == 1:
+            if value.numel() == width:
+                value = value.reshape(1, width)
+            elif value.numel() == 1:
+                value = value.reshape(1, 1)
+            else:
+                value = value[idx:idx + 1].reshape(1, 1)
+        else:
+            row = value[:1] if value.shape[0] == 1 else value[idx:idx + 1]
+            value = row.reshape(1, -1)
+        if width == 2 and value.shape[1] == 1:
+            value = value.expand(1, 2)
+        if value.shape[1] != width:
+            raise ValueError(
+                f"Camera parameter {name} must have {width} values, got {tuple(value.shape)}"
+            )
+        return value
+
+    def _camera_image_size(self, camera_traj, idx, fallback):
+        """Return the pixel size used when the camera intrinsics were built."""
+        image_size = getattr(camera_traj, 'image_size', None)
+        if image_size is None and hasattr(camera_traj, 'get_image_size'):
+            try:
+                image_size = camera_traj.get_image_size()
+            except (AttributeError, TypeError, ValueError):
+                image_size = None
+        if image_size is None:
+            return fallback
+
+        if not torch.is_tensor(image_size):
+            image_size = torch.as_tensor(image_size)
+        image_size = image_size.detach().reshape(-1, 2)
+        if image_size.numel() == 0:
+            return fallback
+        row = image_size[0 if image_size.shape[0] == 1 else idx]
+        source_h, source_w = (float(row[0]), float(row[1]))
+        if source_h <= 0 or source_w <= 0:
+            return fallback
+        return source_h, source_w
+
+    def _extract_camera_dict(self, camera_traj, idx, image_size=None):
+        is_pytorch3d_camera = hasattr(camera_traj, 'R')
         if hasattr(camera_traj, 'R'):
-            R = camera_traj.R[idx:idx+1].to(self.device)
+            R_value = camera_traj.R.to(self.device)
+            if R_value.dim() == 2:
+                R = R_value.unsqueeze(0)
+            elif R_value.shape[0] == 1:
+                R = R_value[:1]
+            else:
+                R = R_value[idx:idx+1]
         else:
             R = torch.eye(3, device=self.device).unsqueeze(0)
         if hasattr(camera_traj, 'T'):
-            t = camera_traj.T[idx:idx+1].to(self.device)
-            if t.dim() == 2:
-                t = t.unsqueeze(-1)
+            t = self._camera_parameter(camera_traj.T, idx, 3, 'T').unsqueeze(-1)
         else:
             t = torch.zeros(1, 3, 1, device=self.device)
         if hasattr(camera_traj, 'focal_length'):
-            focal = camera_traj.focal_length[idx:idx+1].to(self.device)
+            focal = self._camera_parameter(camera_traj.focal_length, idx, 2, 'focal_length')
         else:
             focal = torch.ones(1, 2, device=self.device)
         if hasattr(camera_traj, 'principal_point'):
-            principal = camera_traj.principal_point[idx:idx+1].to(self.device)
+            principal = self._camera_parameter(camera_traj.principal_point, idx, 2, 'principal_point')
         else:
             principal = torch.zeros(1, 2, device=self.device)
+
+        if is_pytorch3d_camera:
+            # ``camera_traj`` is a PyTorch3D camera.  Store the frame record
+            # in the canonical RDF column-vector convention expected by
+            # ``warp_rgb_depth``; otherwise rotations would be transposed and
+            # the horizontal/vertical axes would be mirrored during
+            # verification.
+            R, t = EvidenceRoutingEngine._pytorch3d_to_rdf(R, t)
+
+        if image_size is not None:
+            source_h, source_w = self._camera_image_size(
+                camera_traj, idx, fallback=image_size
+            )
+            target_h, target_w = image_size
+            scale = torch.tensor(
+                [float(target_w) / source_w, float(target_h) / source_h],
+                device=self.device,
+                dtype=focal.dtype,
+            )
+            # PyTorch3D stores focal length and principal point in pixels.
+            # The renderer is later resized for the diffusion model, so the
+            # intrinsics must follow that same resize.
+            focal = focal * scale
+            principal = principal * scale
 
         K = torch.zeros(1, 3, 3, device=self.device)
         K[:, 0, 0] = focal[:, 0]
@@ -326,7 +498,7 @@ class ViewCrafter:
         render_results = F.interpolate(render_results.permute(0,3,1,2), size=target_size, mode='bilinear', align_corners=False).permute(0,2,3,1)
 
         # Resize depths to match render_results size
-        depths = F.interpolate(depths, size=target_size, mode='bilinear', align_corners=False)
+        depths = F.interpolate(depths, size=target_size, mode='nearest')
         render_results[0] = self._resize_reference_frame(self.img_ori)
         if reset_tail_to_ref:
             render_results[-1] = self._resize_reference_frame(self.img_ori)
@@ -365,6 +537,7 @@ class ViewCrafter:
 
         ## render, 从c2ws[0]即ref image对应的相机开始
         imgs = np.array(self.scene.imgs)
+        target_size = (self.opts.height, self.opts.width)
 
         if self.opts.mode == 'single_view_ref_iterative':
             c2ws,pcd =  world_point_to_obj(poses=c2ws, points=torch.stack(pcd), k=0, r=radius, elevation=self.opts.elevation, device=self.device)
@@ -406,9 +579,10 @@ class ViewCrafter:
         else:
             raise KeyError(f"Invalid Mode: {self.opts.mode}")
 
-        depths = F.interpolate(depths, size=target_size, mode='bilinear', align_corners=False)
+        depths = F.interpolate(depths, size=target_size, mode='nearest')
         reference_overrides = {0: reference_image} if reference_image is not None else None
-        frame_list = self._prepare_frame_list(render_results, depths, camera_traj, viewmask=viewmask, reference_overrides=reference_overrides)
+        frame_list = self._prepare_frame_list(render_results, depths, camera_traj, viewmask=viewmask, reference_overrides=reference_overrides,
+                                              observation_indices=([0] if self.opts.mode == 'single_view_ref_iterative' else []))
 
         save_video(render_results, os.path.join(self.opts.save_dir, f'render{iter}.mp4'))
         save_pointcloud_with_normals(imgs, pcd, msk=masks, save_path=os.path.join(self.opts.save_dir, f'pcd{iter}.ply') , mask_pc=True, reduce_pc=False)
@@ -446,7 +620,7 @@ class ViewCrafter:
         render_results, viewmask, depths = self.run_render(pcd, imgs,masks, H, W, camera_traj,num_views)
         target_size = (self.opts.height, self.opts.width)
         render_results = F.interpolate(render_results.permute(0,3,1,2), size=target_size, mode='bilinear', align_corners=False).permute(0,2,3,1)
-        depths = F.interpolate(depths, size=target_size, mode='bilinear', align_corners=False)
+        depths = F.interpolate(depths, size=target_size, mode='nearest')
         
         reference_overrides = {}
         for i in range(len(self.img_ori)):
@@ -464,7 +638,8 @@ class ViewCrafter:
             start = i*(self.opts.video_length - 1)
             end = self.opts.video_length + start
             clip_frames = frame_list_full[start:end] if frame_list_full is not None else None
-            diffusion_results.append(self.run_diffusion(render_results[start:end], frame_list=clip_frames))
+            diffusion_results.append(self.run_diffusion(render_results[start:end], frame_list=clip_frames,
+                                                       observation_frames=frame_list_full))
         print(f'Finish!\n')
         diffusion_results = torch.cat(diffusion_results)
         save_video((diffusion_results + 1.0) / 2.0, os.path.join(self.opts.save_dir, f'diffusion.mp4'))
@@ -494,7 +669,7 @@ class ViewCrafter:
         render_results, viewmask, depths = self.run_render([pcd_ref], [img_ref],masks, H, W, camera_traj,num_views)
         target_size = (self.opts.height, self.opts.width)
         render_results = F.interpolate(render_results.permute(0,3,1,2), size=target_size, mode='bilinear', align_corners=False).permute(0,2,3,1)
-        depths = F.interpolate(depths, size=target_size, mode='bilinear', align_corners=False)
+        depths = F.interpolate(depths, size=target_size, mode='nearest')
         render_results[0] = self._resize_reference_frame(self.img_ori[0])
         reference_overrides = {0: self.img_ori[0]}
         frame_list = self._prepare_frame_list(render_results, depths, camera_traj, viewmask=viewmask, reference_overrides=reference_overrides)
@@ -596,16 +771,49 @@ class ViewCrafter:
         self.diffusion = model
 
     def setup_warp_guidance(self):
-        # Initialize the warp guidance engine with WAVE-style frequency domain mixing
-        self.warp_guidance = WarpGuidanceEngine(
+        denoiser = getattr(getattr(self.diffusion, 'model', None), 'diffusion_model', None)
+        model_temporal_length = getattr(self.diffusion, 'temporal_length', None)
+        if model_temporal_length is None:
+            model_temporal_length = getattr(denoiser, 'temporal_length', None)
+        if (
+            model_temporal_length is not None
+            and self.opts.video_length > int(model_temporal_length)
+        ):
+            raise ValueError(
+                "video_length exceeds the temporal length supported by the "
+                f"checkpoint ({self.opts.video_length} > {model_temporal_length})."
+            )
+
+        # Initialize the process-level evidence router.
+        self.warp_guidance = EvidenceRoutingEngine(
             vae_encoder=self.diffusion.first_stage_model,
             device=self.device,
-            # WAVE-style parameters for stable background
+            num_recent=getattr(self.opts, 'num_recent', 8),
+            num_ref=getattr(self.opts, 'num_ref', 3),
+            overlap_threshold=getattr(self.opts, 'overlap_threshold', 0.1),
+            # Frequency-preserving latent parameters for coarse layout
             use_freq_mix=getattr(self.opts, 'use_freq_mix', True),  # Enable FFT frequency mixing
             filter_type=getattr(self.opts, 'filter_type', 'gaussian'),  # 'gaussian' or 'ideal'
             freq_cutoff=getattr(self.opts, 'freq_cutoff', 0.25),  # Frequency cutoff (0.0-1.0)
             low_freq_norm=getattr(self.opts, 'low_freq_norm', True),  # Normalize low-freq (key!)
             noise_level=getattr(self.opts, 'noise_level', 999),  # Noise level for q_sample
+            use_evidence_routing=getattr(self.opts, 'use_evidence_routing', True),
+            depth_rel_tolerance=getattr(self.opts, 'depth_rel_tolerance', 0.08),
+            depth_abs_tolerance=getattr(self.opts, 'depth_abs_tolerance', 0.02),
+            conflict_threshold=getattr(self.opts, 'conflict_threshold', 0.08),
+            min_support_ratio=getattr(self.opts, 'min_support_ratio', 0.02),
+            admit_ratio_threshold=getattr(self.opts, 'admit_ratio_threshold', 0.20),
+            max_conflict_ratio=getattr(self.opts, 'max_conflict_ratio', 0.15),
+            attenuated_weight=getattr(self.opts, 'attenuated_weight', 0.35),
+            abstain_gate=getattr(self.opts, 'abstain_gate', 0.02),
+            geo_early_scale=getattr(self.opts, 'geo_early_scale', 1.0),
+            geo_late_scale=getattr(self.opts, 'geo_late_scale', 0.35),
+            use_fmi=getattr(self.opts, 'use_fmi', True),
+            init_scale_mode=('uncertainty' if self.loop_config.enabled else getattr(self.opts, 'init_scale_mode', 'legacy')),
+            init_depth_rel_std=getattr(self.opts, 'init_depth_rel_std', 0.05),
+            init_fixed_sigma=getattr(self.opts, 'init_fixed_sigma', 1.0),
+            init_scales=getattr(self.opts, 'init_scales', (0., 0.5, 1., 2., 4., 8.)),
+            use_cga=getattr(self.opts, 'use_cga', True),
         )
 
         h, w = self.opts.height // 8, self.opts.width // 8

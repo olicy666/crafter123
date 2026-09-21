@@ -42,7 +42,7 @@ class RelativePosition(nn.Module):
 class CrossAttention(nn.Module):
 
     def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0., 
-                 relative_position=False, temporal_length=None, video_length=None, image_cross_attention=False, image_cross_attention_scale=1.0, image_cross_attention_scale_learnable=False, text_context_len=77):
+                 relative_position=False, temporal_length=None, video_length=None, image_cross_attention=False, image_cross_attention_scale=1.0, image_cross_attention_scale_learnable=False, text_context_len=77, temporal_attention=False):
         super().__init__()
         inner_dim = dim_head * heads
         context_dim = default(context_dim, query_dim)
@@ -67,6 +67,10 @@ class CrossAttention(nn.Module):
                 self.forward = self.efficient_forward
 
         self.video_length = video_length
+        # This explicit tag prevents a frame-level routing matrix from being
+        # mistaken for a spatial token matrix when their sizes happen to
+        # coincide (for example, a 4x4 feature map and a 16-frame clip).
+        self.temporal_attention = temporal_attention
         self.image_cross_attention = image_cross_attention
         self.image_cross_attention_scale = image_cross_attention_scale
         self.text_context_len = text_context_len
@@ -102,11 +106,10 @@ class CrossAttention(nn.Module):
 
         sim = torch.einsum('b i d, b j d -> b i j', q, k) * self.scale
 
-        # Apply geometric bias if provided (only for self-attention blocks)
+        # Apply evidence-routing bias only on the temporal self-attention
+        # path. Spatial attention does not use a frame-level bias.
         if geo_bias is not None:
-            bias_tensor = self._expand_geo_bias(geo_bias, sim, h, spatial_self_attn)
-            if bias_tensor is not None:
-                sim += bias_tensor
+            sim = self._apply_geo_bias(sim, geo_bias, h, spatial_self_attn)
 
         if self.relative_position:
             len_q, len_k, len_v = q.shape[1], k.shape[1], v.shape[1]
@@ -150,38 +153,65 @@ class CrossAttention(nn.Module):
         
         return self.to_out(out)
     
-    def _expand_geo_bias(self, geo_bias, sim, heads, spatial_self_attn):
-        if geo_bias is None:
-            return None
-        if not spatial_self_attn:
-            # Only apply geometry bias to self-attention blocks
-            return geo_bias if torch.is_tensor(geo_bias) else None
-
-        if torch.is_tensor(geo_bias):
-            return geo_bias
+    def _apply_geo_bias(self, sim, geo_bias, heads, spatial_self_attn):
+        """Broadcast a compact ``[B, T, T]`` gate over temporal tokens."""
+        if geo_bias is None or not isinstance(geo_bias, dict):
+            return sim
+        if not geo_bias.get('temporal_attention_only', False) or not spatial_self_attn:
+            return sim
+        if not self.temporal_attention:
+            return sim
 
         frame_bias = geo_bias.get('frame_bias', None)
         temporal_length = geo_bias.get('temporal_length', None)
         if frame_bias is None or temporal_length is None or temporal_length <= 0:
-            return None
+            return sim
+        if not torch.is_tensor(frame_bias) or frame_bias.ndim != 3:
+            return sim
+        if tuple(frame_bias.shape[1:]) != (temporal_length, temporal_length):
+            return sim
 
+        n_q, n_k = sim.shape[1], sim.shape[2]
+        if n_q != temporal_length or n_k != temporal_length:
+            return sim
+
+        frame_bias = frame_bias.to(device=sim.device, dtype=sim.dtype)
         batch = frame_bias.shape[0]
-        n_q = sim.shape[1]
-        n_k = sim.shape[2]
-        if n_q % temporal_length != 0 or n_k % temporal_length != 0:
-            return None
+        sim_batch = sim.shape[0] // heads
+        if batch <= 0 or sim_batch % batch != 0:
+            return sim
 
-        tokens_per_frame_q = n_q // temporal_length
-        tokens_per_frame_k = n_k // temporal_length
-        device = sim.device
-        idx_q = torch.arange(n_q, device=device) // tokens_per_frame_q
-        idx_k = torch.arange(n_k, device=device) // tokens_per_frame_k
-        bias = frame_bias[:, idx_q][:, :, idx_k]
-        bias = bias.unsqueeze(1).repeat(1, heads, 1, 1)
-        bias = bias.view(batch * heads, n_q, n_k)
-        return bias.to(sim.dtype)
+        spatial_repeats = sim_batch // batch
+        temporal_scale = geo_bias.get('temporal_scale', 1.0)
+        if not torch.is_tensor(temporal_scale):
+            temporal_scale = torch.tensor(
+                temporal_scale, device=sim.device, dtype=sim.dtype
+            )
+        temporal_scale = temporal_scale.to(device=sim.device, dtype=sim.dtype)
+        if temporal_scale.numel() == 1:
+            temporal_scale = temporal_scale.reshape(1).expand(batch)
+        elif temporal_scale.numel() == batch:
+            temporal_scale = temporal_scale.reshape(batch)
+        else:
+            return sim
+
+        # Avoid materializing [B*H*W*heads, T, T] before the addition.
+        sim_view = sim.reshape(batch, spatial_repeats, heads, n_q, n_k)
+        sim_view = sim_view + frame_bias[:, None, None, :, :] * temporal_scale[
+            :, None, None, None, None
+        ]
+        return sim_view.reshape_as(sim)
 
     def efficient_forward(self, x, context=None, mask=None, geo_bias=None):
+        # xFormers does not consume the dense frame-level bias used by CGA.
+        # Fall back to the reference implementation whenever an internal
+        # routing signal is present so enabling xFormers cannot silently
+        # disable the proposed sampler intervention.
+        if geo_bias is not None or exists(mask):
+            return CrossAttention.forward(
+                self, x, context=context, mask=mask, geo_bias=geo_bias
+            )
+
         spatial_self_attn = (context is None)
         k_ip, v_ip, out_ip = None, None, None
 
@@ -382,9 +412,18 @@ class TemporalTransformer(nn.Module):
 
         if relative_position:
             assert(temporal_length is not None)
-            attention_cls = partial(CrossAttention, relative_position=True, temporal_length=temporal_length)
+            attention_cls = partial(
+                CrossAttention,
+                relative_position=True,
+                temporal_length=temporal_length,
+                temporal_attention=True,
+            )
         else:
-            attention_cls = partial(CrossAttention, temporal_length=temporal_length)
+            attention_cls = partial(
+                CrossAttention,
+                temporal_length=temporal_length,
+                temporal_attention=True,
+            )
         if self.causal_attention:
             assert(temporal_length is not None)
             self.mask = torch.tril(torch.ones([1, temporal_length, temporal_length]))
@@ -407,7 +446,7 @@ class TemporalTransformer(nn.Module):
             self.proj_out = zero_module(nn.Linear(inner_dim, in_channels))
         self.use_linear = use_linear
 
-    def forward(self, x, context=None):
+    def forward(self, x, context=None, geo_bias=None):
         b, c, t, h, w = x.shape
         x_in = x
         x = self.norm(x)
@@ -429,10 +468,15 @@ class TemporalTransformer(nn.Module):
         else:
             mask = None
 
+        temporal_geo_bias = geo_bias
+        if isinstance(geo_bias, dict):
+            temporal_geo_bias = dict(geo_bias)
+            temporal_geo_bias['temporal_attention_only'] = True
+
         if self.only_self_att:
             ## note: if no context is given, cross-attention defaults to self-attention
             for i, block in enumerate(self.transformer_blocks):
-                x = block(x, mask=mask)
+                x = block(x, mask=mask, geo_bias=temporal_geo_bias)
             x = rearrange(x, '(b hw) t c -> b hw t c', b=b).contiguous()
         else:
             x = rearrange(x, '(b hw) t c -> b hw t c', b=b).contiguous()
@@ -444,7 +488,16 @@ class TemporalTransformer(nn.Module):
                         context[j],
                         't l con -> (t r) l con', r=(h * w) // t, t=t).contiguous()
                     ## note: causal mask will not applied in cross-attention case
-                    x[j] = block(x[j], context=context_j)
+                    block_geo_bias = temporal_geo_bias
+                    if isinstance(temporal_geo_bias, dict):
+                        block_geo_bias = dict(temporal_geo_bias)
+                        frame_bias = block_geo_bias.get('frame_bias', None)
+                        if torch.is_tensor(frame_bias):
+                            block_geo_bias['frame_bias'] = frame_bias[j:j + 1]
+                        temporal_scale = block_geo_bias.get('temporal_scale', None)
+                        if torch.is_tensor(temporal_scale) and temporal_scale.numel() > 1:
+                            block_geo_bias['temporal_scale'] = temporal_scale[j:j + 1]
+                    x[j] = block(x[j], context=context_j, geo_bias=block_geo_bias)
         
         if self.use_linear:
             x = self.proj_out(x)
